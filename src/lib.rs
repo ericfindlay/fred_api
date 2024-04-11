@@ -2,10 +2,10 @@
 `fred_api` makes requests to [FRED](https://fred.stlouisfed.org/) to download
 economic data, caching it as bytes. When requests are made to FRED or the cache, the
 response is written into the file `debug.xml` for convenient debugging. The FRED API
-key must be set as an environment variable:
+key is embedded in the code:
 
 ```text
-FRED_API_KEY=abcdefghijklmnopqrstuvwxyz123456
+API_KEY=abcdefghijklmnopqrstuvwxyz123456
 ```
 
 ```no_run
@@ -64,11 +64,10 @@ use {
         Regex,
     },
     sled::{Db, IVec},
-    std::{fmt, fs},
+    std::{fmt, fs, env},
 };
 
 static BASE_URI: &'static str = "https://api.stlouisfed.org/fred";
-static API_KEY: &'static str ="98191525b30ce9f08c8f9b76da6b2b43";
 
 #[macro_export]
 macro_rules! src {
@@ -115,12 +114,18 @@ let (req_spec, req) = request("series/observations?series_id=GNPCA").unwrap();
 pub fn build_request(mid_part: &str) -> Result<(RequestSpec, Request<Body>), String> {
     let req_spec = RequestSpec::new(mid_part);
     let req_builder: http::request::Builder = Request::builder();
-    let req = req_builder
-            .method("GET")
-            .uri(req_spec.uri())
-            .body(Body::empty())
-            .unwrap();
-    Ok((req_spec, req))
+    let uri = req_spec.uri()?;
+    match req_builder
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+    {
+        Ok(req) => Ok((req_spec, req)),
+        Err(err) => {
+            let msg = format!("{} {}", src!(), err);
+            Err(msg)
+        },
+    }
 }
 
 /**
@@ -278,8 +283,14 @@ impl RequestSpec {
         RequestSpec(String::from(mid_part))
     }
 
-    pub fn uri(&self) -> String {
-        format!("{}/{}&api_key={}", BASE_URI, self.0, API_KEY)
+    pub fn uri(&self) -> Result<String, String> {
+        let key = match env::var("FRED_API_KEY") {
+            Ok(key) => key,
+            Err(err) => {
+                return Err("The FRED_API_KEY environment variable must be set.".into())
+            },
+        };
+        Ok(format!("{}/{}&api_key={}", BASE_URI, self.0, key))
     }
 }
 
