@@ -3,9 +3,6 @@ name = "fred_api"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies.bytes]
-version = "1.5.0"
-
 [dependencies.http]
 version = "0.2.9"
 

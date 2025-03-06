@@ -1,8 +1,9 @@
 /*!
 `fred_api` makes requests to [FRED](https://fred.stlouisfed.org/) to download
-economic data, caching it as bytes. When requests are made to FRED or the cache, the
-response is written into the file `debug.xml` for convenient debugging. The FRED API
-key is embedded in the code:
+economic data, caching it to a data-store so that repeated requests to FRED can be
+avoided. Requires the ``FRED_API`` environment variable to be set. When requests
+are made to FRED or the cache, the response is written into the file `debug.xml` for
+convenient debugging.
 
 ```text
 API_KEY=abcdefghijklmnopqrstuvwxyz123456
@@ -32,7 +33,7 @@ let bytes = send_request(&req_spec, req, true, false, &cache).await.unwrap();
 // Consult the FRED API docs XML responses to determine the fields to be captured
 // from the bytes. The fields must be specified in the same order they appear in the
 // response.
-let caps: Vec<Vec<Vec<u8>>> = capture_fields("observation", vec!("date", "value"), bytes);
+let caps: Vec<Vec<Vec<u8>>> = capture_fields("observation", vec!("date", "value"), &bytes);
 assert_eq!(caps[0][0], "   ".as_bytes()); // date
 assert_eq!(caps[0][1], "   ".as_bytes()); // value
 # })
@@ -40,32 +41,23 @@ assert_eq!(caps[0][1], "   ".as_bytes()); // value
 
 ### Minor Details 
 
-Requests are concurrent and the is no rate limit on the requests. Hopefully making
+Requests are concurrent and there is no rate limit on the requests. Hopefully making
 use of the cache rather than repeatedly making requests for the same data is sufficient
 to prevent FRED from blocking excessive requests.
 
 `capture_fields()` uses regular expressions that assume the data is "well-formed" and
 the fields are consistently ordered. I haven't come across any problems in my own
 use, but I haven't tried to make these expressions robust in any way. There is always
-the option of just taking the bytes as is and doing one's own deserialization (which I
-would recommend as everyone's reliability/simplicity trade-offs are different).
+the option of just taking the bytes as is and doing one's own deserialization (which is
+recommended in any case because everyone's reliability/simplicity trade-offs are different).
 */
 
 use {
-    bytes::Bytes,
     http::Response,
-    hyper::{
-        Body,
-        Client,
-        Request,
-        StatusCode,
-    },
+    hyper::{Body, Client, Request, StatusCode},
     hyper::client::HttpConnector,
     hyper_tls::HttpsConnector,
-    regex::bytes::{
-        CaptureMatches,
-        Regex,
-    },
+    regex::bytes::{CaptureMatches, Regex},
     sled::{Db, IVec},
     std::{fmt, fs, env},
 };
@@ -118,11 +110,7 @@ pub fn build_request(mid_part: &str) -> Result<(RequestSpec, Request<Body>), Str
     let req_spec = RequestSpec::new(mid_part);
     let req_builder: http::request::Builder = Request::builder();
     let uri = req_spec.uri()?;
-    match req_builder
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-    {
+    match req_builder.method("GET").uri(uri).body(Body::empty()) {
         Ok(req) => Ok((req_spec, req)),
         Err(err) => {
             let msg = format!("{} {}", src!(), err);
@@ -134,11 +122,10 @@ pub fn build_request(mid_part: &str) -> Result<(RequestSpec, Request<Body>), Str
 /**
 Make a request from cache.
 */
-fn cache_request(req_spec: &RequestSpec, db: &Db) -> Result<Option<Bytes>, String> {
+fn cache_request(req_spec: &RequestSpec, db: &Db) -> Result<Option<Vec<u8>>, String> {
     let key: IVec = req_spec.clone().into();
     let ivec = match db.get(key) {
         Ok(Some(ivec)) => ivec,
-
         Ok(None) => {
             if let Err(err) = fs::write( "debug.xml", format!("{} not in cache", req_spec)) {
                 let msg = format!("{} {}", src!(), err);
@@ -151,8 +138,8 @@ fn cache_request(req_spec: &RequestSpec, db: &Db) -> Result<Option<Bytes>, Strin
             return Err(msg)
         },
     };
-    let bytes: Bytes = ivec.as_ref().to_vec().into();
-    if let Err(err) = fs::write("debug.xml", bytes.as_ref()) {
+    let bytes: Vec<u8> = ivec.to_vec();
+    if let Err(err) = fs::write("debug.xml", &bytes) {
         let msg = format!("{} {}", src!(), err);
         return Err(msg)
     };
@@ -167,7 +154,7 @@ in the cache.
 async fn fred_request(
     req_spec: &RequestSpec,
     req: Request<Body>,
-    db: &Db) -> Result<Bytes, String> 
+    db: &Db) -> Result<Vec<u8>, String> 
 {
     let client_builder: hyper::client::Builder = Client::builder();
     let mut https_connector: HttpsConnector<HttpConnector> = HttpsConnector::new();
@@ -185,18 +172,18 @@ async fn fred_request(
     let status_code = resp.status();
     match resp.status() {
         StatusCode::OK => {
-            let bytes: Bytes = match hyper::body::to_bytes(resp).await {
-                Ok(b) => b,
+            let bytes: Vec<u8> = match hyper::body::to_bytes(resp).await {
+                Ok(b) => b.to_vec(),
                 Err(err) => {
                     let msg = format!("{} {}", src!(), err);
                     return Err(msg)
                 },
             };
-            if let Err(err) = fs::write("debug.xml", bytes.as_ref()) {
+            if let Err(err) = fs::write("debug.xml", &bytes) {
                 let msg = format!("{} {}", src!(), err);
                 return Err(msg)
             };
-            write_to_cache(req_spec, bytes.clone(), db)?;
+            write_to_cache(req_spec, &bytes.clone(), db)?;
             Ok(bytes)
         }
         _ => Err(format!("{} {}", src!(), status_code)),
@@ -223,7 +210,7 @@ pub async fn send_request(
     req: Request<Body>,
     cache: bool,
     fred: bool,
-    db: &Db) -> Result<Bytes, String> 
+    db: &Db) -> Result<Vec<u8>, String> 
 {
     match (cache, fred) {
         (true, true) => {
@@ -255,7 +242,7 @@ pub async fn send_request(
 /*
 Write a FRED response into the caching database.
 */
-fn write_to_cache(req_spec: &RequestSpec, bytes: Bytes, db: &Db) -> Result<(), String> {
+fn write_to_cache(req_spec: &RequestSpec, bytes: &[u8], db: &Db) -> Result<(), String> {
     let key: IVec = req_spec.clone().into();
     let value: IVec = bytes.as_ref().into();
     match db.contains_key(&key) {
@@ -290,7 +277,8 @@ impl RequestSpec {
         let key = match env::var("FRED_API_KEY") {
             Ok(key) => key,
             Err(err) => {
-                return Err("The FRED_API_KEY environment variable must be set.".into())
+                let msg = format!("{} The FRED_API_KEY environment variable must be set. {}", src!(), err);
+                return Err(msg)
             },
         };
         Ok(format!("{}/{}&api_key={}", BASE_URI, self.0, key))
@@ -298,16 +286,11 @@ impl RequestSpec {
 }
 
 impl fmt::Display for RequestSpec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.0) }
 }
 
 impl Into<IVec> for RequestSpec {
-    fn into(self) -> IVec {
-        self.0.as_bytes().into()
-
-    }
+    fn into(self) -> IVec { self.0.as_bytes().into() }
 }
 
 /**
@@ -318,7 +301,7 @@ pub fn capture_fields(
     // "<observation field1="value"...>" The first tags here is 'observation'.
     first_tag: &str,
     fields: Vec<&str>,
-    bytes: Bytes) -> Vec<Vec<Vec<u8>>>
+    bytes: &[u8]) -> Vec<Vec<Vec<u8>>>
 {
     let spacer = "[^>]*";
 
@@ -351,7 +334,7 @@ pub fn capture_fields(
 #[test]
 fn build_fields_regex_step_1() {
 
-    let bytes: Bytes = r#"<?xml version="1.0" encoding="utf-8" ?>
+    let bytes: Vec<u8> = r#"<?xml version="1.0" encoding="utf-8" ?>
 <seriess realtime_start="2023-11-30" realtime_end="2023-11-30" order_by="series_id" sort_order="asc" count="157" offset="0" limit="1000">
   <series id="AUSUR24NAA" realtime_start="2023-11-30" realtime_end="2023-11-30" title="Adjusted Unemployment Rate for Persons Ages 20 to 24 in Australia (DISCONTINUED)" observation_start="1978-01-01" observation_end="2012-01-01" frequency="Annual" frequency_short="A" units="Percent" units_short="%" seasonal_adjustment="Not Seasonally Adjusted" seasonal_adjustment_short="NSA" last_updated="2013-06-10 09:17:22-05" popularity="0" group_popularity="0" notes="Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparisons (ILC) program. This is the last BLS release of international comparisons of annual labor force statistics."/>
   <series id="AUSURAMS" realtime_start="2023-11-30" realtime_end="2023-11-30" title="Adjusted Unemployment Rate in Australia (DISCONTINUED)" observation_start="2007-01-01" observation_end="2013-06-01" frequency="Monthly" frequency_short="M" units="Percent" units_short="%" seasonal_adjustment="Seasonally Adjusted" seasonal_adjustment_short="SA" last_updated="2013-09-03 11:06:02-05" popularity="1" group_popularity="1" notes="Series is adjusted to U.S. Concepts.
@@ -368,7 +351,7 @@ Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparis
 #[test]
 fn build_fields_regex_step_2() {
 
-    let bytes: Bytes = r#"<?xml version="1.0" encoding="utf-8" ?>
+    let bytes: Vec<u8> = r#"<?xml version="1.0" encoding="utf-8" ?>
 <seriess realtime_start="2023-11-30" realtime_end="2023-11-30" order_by="series_id" sort_order="asc" count="157" offset="0" limit="1000">
   <series id="AUSUR24NAA" realtime_start="2023-11-30" realtime_end="2023-11-30" title="Adjusted Unemployment Rate for Persons Ages 20 to 24 in Australia (DISCONTINUED)" observation_start="1978-01-01" observation_end="2012-01-01" frequency="Annual" frequency_short="A" units="Percent" units_short="%" seasonal_adjustment="Not Seasonally Adjusted" seasonal_adjustment_short="NSA" last_updated="2013-06-10 09:17:22-05" popularity="0" group_popularity="0" notes="Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparisons (ILC) program. This is the last BLS release of international comparisons of annual labor force statistics."/>
   <series id="AUSURAMS" realtime_start="2023-11-30" realtime_end="2023-11-30" title="Adjusted Unemployment Rate in Australia (DISCONTINUED)" observation_start="2007-01-01" observation_end="2013-06-01" frequency="Monthly" frequency_short="M" units="Percent" units_short="%" seasonal_adjustment="Seasonally Adjusted" seasonal_adjustment_short="SA" last_updated="2013-09-03 11:06:02-05" popularity="1" group_popularity="1" notes="Series is adjusted to U.S. Concepts.
@@ -390,14 +373,14 @@ Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparis
 #[test]
 fn build_fields_regex_step_3() {
 
-    let bytes: Bytes = r#"<?xml version="1.0" encoding="utf-8" ?>
+    let bytes: Vec<u8> = r#"<?xml version="1.0" encoding="utf-8" ?>
 <seriess realtime_start="2023-11-30" realtime_end="2023-11-30" order_by="series_id" sort_order="asc" count="157" offset="0" limit="1000">
   <series id="AUSUR24NAA" realtime_start="2023-11-30" realtime_end="2023-11-30" title="Adjusted Unemployment Rate for Persons Ages 20 to 24 in Australia (DISCONTINUED)" observation_start="1978-01-01" observation_end="2012-01-01" frequency="Annual" frequency_short="A" units="Percent" units_short="%" seasonal_adjustment="Not Seasonally Adjusted" seasonal_adjustment_short="NSA" last_updated="2013-06-10 09:17:22-05" popularity="0" group_popularity="0" notes="Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparisons (ILC) program. This is the last BLS release of international comparisons of annual labor force statistics."/>
   <series id="AUSURAMS" realtime_start="2023-11-30" realtime_end="2023-11-30" title="Adjusted Unemployment Rate in Australia (DISCONTINUED)" observation_start="2007-01-01" observation_end="2013-06-01" frequency="Monthly" frequency_short="M" units="Percent" units_short="%" seasonal_adjustment="Seasonally Adjusted" seasonal_adjustment_short="SA" last_updated="2013-09-03 11:06:02-05" popularity="1" group_popularity="1" notes="Series is adjusted to U.S. Concepts.
 Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparisons (ILC) program. This is the last BLS release of international unemployment rates and employment indexes."/>
 </seriess>"#.as_bytes().into();
 
-    let caps = capture_fields("series", vec!("id"), bytes);
+    let caps = capture_fields("series", vec!("id"), &bytes);
     assert_eq!(caps[0], vec!("AUSUR24NAA".as_bytes()));
     assert_eq!(caps[1], vec!("AUSURAMS".as_bytes()));
 }
