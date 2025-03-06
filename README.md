@@ -38,25 +38,6 @@ assert_eq!(caps[0][1], "   ".as_bytes()); // value
 # })
 ```
 
-### Minor Details 
-
-Requests are concurrent and there is no rate limit on the requests. Hopefully making
-use of the cache rather than repeatedly making requests for the same data is sufficient
-to prevent FRED from blocking excessive requests.
-
-`capture_fields()` uses regular expressions that assume the data is "well-formed" and
-the fields are consistently ordered. I haven't come across any problems in my own
-use, but I haven't tried to make these expressions robust in any way. There is always
-the option of just taking the bytes as is and doing one's own deserialization (which is
-recommended in any case because everyone's reliability/simplicity trade-offs are different).
-
-/*!
-`fred_api` makes requests to [FRED](https://fred.stlouisfed.org/) to download
-economic data, caching it to a data-store so that repeated requests to FRED can be
-avoided. Requires the ``FRED_API`` environment variable to be set. When requests
-are made to FRED or the cache, the response is written into the file `debug.xml` for
-convenient debugging.
-
 ### Requirements
 
 1. ``FRED_API`` environment variable has to be set.
@@ -99,3 +80,23 @@ assert_eq!(caps[0][0], "   ".as_bytes()); // date
 assert_eq!(caps[0][1], "   ".as_bytes()); // value
 # })
 ```
+
+### Minor Details 
+
+Requests are concurrent and there is no rate limit on the requests. Hopefully making
+use of the cache rather than repeatedly making requests for the same data is sufficient
+to prevent FRED from blocking excessive requests.
+
+`capture_fields()` uses regular expressions that assume the data is "well-formed" and
+the fields are consistently ordered. I haven't come across any problems in my own
+use, but I haven't tried to make these expressions robust in any way. There is always
+the option of just taking the bytes as is and doing one's own deserialization (which is
+recommended in any case because everyone's reliability/simplicity trade-offs are different).
+
+/*!
+`fred_api` makes requests to [FRED](https://fred.stlouisfed.org/) to download
+economic data, caching it to a data-store so that repeated requests to FRED can be
+avoided. Requires the ``FRED_API`` environment variable to be set. When requests
+are made to FRED or the cache, the response is written into the file `debug.xml` for
+convenient debugging.
+
