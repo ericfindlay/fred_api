@@ -15,7 +15,7 @@ async fn make_request_to_fred() {
                 [60, 63, 120, 109, 108, 32, 118, 101, 114, 115, 105, 111, 110, 61, 34, 49, 46, 48, 34, 32 ],
             );
         }
-        Err(err) => assert!(false),
+        Err(_) => assert!(false),
     };
 
 }

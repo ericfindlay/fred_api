@@ -343,7 +343,7 @@ Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparis
 
     let re_init = "<series [^>]*>";
     let re = Regex::new(re_init).unwrap();
-    let mut iter = re.find_iter(&bytes);
+    let iter = re.find_iter(&bytes);
     let v: Vec<()> = iter.map(|_| ()).collect();
     assert_eq!(v.len(), 2); // two matches
 }
