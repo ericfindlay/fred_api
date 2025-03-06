@@ -5,9 +5,18 @@ avoided. Requires the ``FRED_API`` environment variable to be set. When requests
 are made to FRED or the cache, the response is written into the file `debug.xml` for
 convenient debugging.
 
+### Requirements
+
+1. ``FRED_API`` environment variable has to be set.
+
+2. A directory used to cache requests is required. This directory is specified in the 
+``sled::open("../fred_cache/db")`` function, as shown in the code example below.
+
 ```text
 API_KEY=abcdefghijklmnopqrstuvwxyz123456
 ```
+
+### Code Example
 
 ```no_run
 use {
