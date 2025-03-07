@@ -1,6 +1,6 @@
 [package]
 name = "fred_api"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "API for Federal Reserve Economic Data (FRED)."
 license = "MIT"

@@ -1,7 +1,7 @@
 /*!
 `fred_api` makes requests to [FRED](https://fred.stlouisfed.org/) to download
 economic data, caching it to a data-store so that repeated requests to FRED can be
-avoided. Requires the ``FRED_API`` environment variable to be set. When requests
+avoided. Requires the ``FRED_API_KEY`` environment variable to be set. When requests
 are made to FRED or the cache, the response is written into the file `debug.xml` for
 convenient debugging.
 
