@@ -7,13 +7,15 @@ convenient debugging.
 
 ### Requirements
 
-1. ``FRED_API`` environment variable has to be set.
+1. ``FRED_API_KEY`` environment variable has to be set.
 
 2. A directory used to cache requests is required. This directory is specified in the 
 ``sled::open("../fred_cache/db")`` function, as shown in the code example below.
 
+A key can be obtained by creating an account at [FRED](https://fredaccount.stlouisfed.org/login/secure/)
+, and should be set as an environment variable like
 ```text
-API_KEY=abcdefghijklmnopqrstuvwxyz123456
+FRED_API_KEY=abcdefghijklmnopqrstuvwxyz123456
 ```
 
 ### Code Example
