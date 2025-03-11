@@ -17,36 +17,47 @@ A key can be obtained by creating an account at [FRED](https://fredaccount.stlou
 FRED_API_KEY=abcdefghijklmnopqrstuvwxyz123456
 ```
 
+``Cargo.toml`` should have the following dependences,
+
+```
+fred_api = "0.1.4"
+sled = "0.34.7"
+tokio = "1.44.0"
+```
+
 ### Code Example
 
-```rust
+```no_run
 use {
     fred_api::{build_request, capture_fields, send_request},
-    sled::Db
+    sled::Db,
+    tokio,
 };
 
-# tokio_test::block_on(async {
-// Set the path to the cache. The cache stores the response bytes as is, keyed by
-// the `RequestSpec`.
-let cache: sled::Db = sled::open("../fred_cache/db").unwrap();
+#[tokio::main]
+pub async fn main() {
+    // Set the path to the cache. The cache stores the response bytes as is, keyed by
+    // the `RequestSpec`.
+    let cache: sled::Db = sled::open("../fred_cache/db").unwrap();
 
-// The spec string can be taken from the FRED API docs. `req_spec` uniquely
-// identifies the request and is used as a key in the cache. `req` is a
-// `hyper::Request`.
-let (req_spec, req) = build_request("series/observations?series_id=CPGRLE01AUQ657N").unwrap();
+    // The spec string can be taken from the FRED API docs. `req_spec` uniquely
+    // identifies the request and is used as a key in the cache. `req` is a
+    // `hyper::Request`.
+    let (req_spec, req) = build_request("series/observations?series_id=CPGRLE01AUQ657N").unwrap();
 
-// The boolean values determine whether to request from the cache and/or request from
-// FRED. Successful FRED responses are always cached. Responses with other than HTTP
-// status `Ok` status will return an error.
-let bytes = send_request(&req_spec, req, true, false, &cache).await.unwrap();
+    // The boolean values determine whether to request from the cache and/or request from
+    // FRED. Successful FRED responses are always cached. Responses with other than HTTP
+    // status `Ok` status will return an error.
+    let bytes = send_request(&req_spec, req, true, true, &cache).await.unwrap();
 
-// Consult the FRED API docs XML responses to determine the fields to be captured
-// from the bytes. The fields must be specified in the same order they appear in the
-// response.
-let caps: Vec<Vec<Vec<u8>>> = capture_fields("observation", vec!("date", "value"), &bytes);
-assert_eq!(caps[0][0], "   ".as_bytes()); // date
-assert_eq!(caps[0][1], "   ".as_bytes()); // value
-# })
+    let caps: Vec<Vec<Vec<u8>>> = capture_fields("observation", vec!("date", "value"), &bytes);
+
+    println!("{:?}", String::from_utf8(caps[0][0].clone()));
+    println!("{:?}", String::from_utf8(caps[0][1].clone()));
+
+    assert_eq!(Ok("1971-04-01"), String::from_utf8(caps[0][0].clone()).as_deref());
+    assert_eq!(Ok("0.850603488248666"), String::from_utf8(caps[0][1].clone()).as_deref());
+}
 ```
 
 ### Minor Details 
