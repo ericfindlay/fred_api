@@ -27,7 +27,7 @@ tokio = "1.44.0"
 
 ### Code Example
 
-```no_run
+```rust
 use {
     fred_api::{build_request, capture_fields, send_request},
     sled::Db,
