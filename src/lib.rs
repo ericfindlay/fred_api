@@ -1,16 +1,14 @@
 /*!
 `fred_api` makes requests to [FRED](https://fred.stlouisfed.org/) to download
 economic data, caching it to a data-store so that repeated requests to FRED can be
-avoided. Requires the ``FRED_API_KEY`` environment variable to be set. When requests
-are made to FRED or the cache, the response is written into the file `debug.xml` for
-convenient debugging.
+avoided.
 
 ### Requirements
 
-1. ``FRED_API_KEY`` environment variable has to be set.
+1. ``FRED_API_KEY`` environment variable can be set or supplied directly.
 
-2. A directory used to cache requests is required. This directory is specified in the 
-``sled::open("../fred_cache/db")`` function, as shown in the code example below.
+2. ``FRED_CACHE`` is the directory to place the cache. It can also be set as an
+environment variable or supplied directly.
 
 A key can be obtained by creating an account at [FRED](https://fredaccount.stlouisfed.org/login/secure/)
 , and should be set as an environment variable like
@@ -18,20 +16,13 @@ A key can be obtained by creating an account at [FRED](https://fredaccount.stlou
 FRED_API_KEY=abcdefghijklmnopqrstuvwxyz123456
 ```
 
-``Cargo.toml`` should have the following dependences,
-
-```
-fred_api = "0.1.4"
-sled = "0.34.7"
-tokio = "1.44.0"
-```
-
 ### Code Example
 
 ```no_run
 use {
-    fred_api::{build_request, capture_fields, send_request},
-    sled::Db,
+    debug_err::{DebugErr, src},
+    fred_api::{build_request, FieldIter, fred_cache, Lookup, send_request},
+    sled::{Db, IVec},
     tokio,
 };
 
@@ -39,246 +30,197 @@ use {
 pub async fn main() {
     // Set the path to the cache. The cache stores the response bytes as is, keyed by
     // the `RequestSpec`.
-    let cache: sled::Db = sled::open("../fred_cache/db").unwrap();
+    let cache: sled::Db = sled::open(fred_cache(None).unwrap()).unwrap();
 
-    // The spec string can be taken from the FRED API docs. `req_spec` uniquely
-    // identifies the request and is used as a key in the cache. `req` is a
-    // `hyper::Request`.
-    let (req_spec, req) = build_request("series/observations?series_id=CPGRLE01AUQ657N").unwrap();
+    // See the FRED API documentation to build requests. In these docs each request
+    // category has an example XML request such as:
+    // 
+    // https://api.stlouisfed.org/fred/series/observations?series_id=GNPCA&api_key=abcdefghijklmnopqrstuvwxyz123456
+    //                                 ------------------------------------
+    // The first function argument is underlined section including the "&" or the "?"
+    // preceding "api_key". If the second function argument is None, the API key is read
+    // from the environment variable FRED_API_KEY.
+    let req = build_request("series/observations?series_id=GNPCA&", None).unwrap();
 
-    // The boolean values determine whether to request from the cache and/or request from
-    // FRED. Successful FRED responses are always cached. Responses with other than HTTP
-    // status `Ok` status will return an error.
-    let bytes = send_request(&req_spec, req, true, true, &cache).await.unwrap();
+    // Lookup options are Lookup::FredOnly, Lookup::CacheOnly or
+    // Lookup::FredOnCacheMiss. Successful FRED responses are always cached.
+    let bytes: IVec = send_request(&req, Lookup::FredOnCacheMiss, &cache).await.unwrap();
 
-    let caps: Vec<Vec<Vec<u8>>> = capture_fields("observation", vec!("date", "value"), &bytes);
-
-    println!("{:?}", String::from_utf8(caps[0][0].clone()));
-    println!("{:?}", String::from_utf8(caps[0][1].clone()));
-
-    assert_eq!(Ok("1971-04-01"), String::from_utf8(caps[0][0].clone()).as_deref());
-    assert_eq!(Ok("0.850603488248666"), String::from_utf8(caps[0][1].clone()).as_deref());
+    let mut field_iter = FieldIter::new("observation", vec!("date", "value"), bytes);
+    let fields = field_iter.next().unwrap().unwrap();
+    assert_eq!("1971-04-01", fields[0]);
+    assert_eq!(0.850603488248666, fields[1].parse::<f32>().unwrap());
 }
 ```
-
-### Minor Details 
-
-Requests are concurrent and there is no rate limit on the requests. Hopefully making
-use of the cache rather than repeatedly making requests for the same data is sufficient
-to prevent FRED from blocking excessive requests.
-
-`capture_fields()` uses regular expressions that assume the data is "well-formed" and
-the fields are consistently ordered. I haven't come across any problems in my own
-use, but I haven't tried to make these expressions robust in any way. There is always
-the option of just taking the bytes as is and doing one's own deserialization (which is
-recommended in any case because everyone's reliability/simplicity trade-offs are different).
 */
 
 use {
-    http::Response,
-    hyper::{Body, Client, Request, StatusCode},
-    hyper::client::HttpConnector,
-    hyper_tls::HttpsConnector,
-    regex::bytes::{CaptureMatches, Regex},
+    debug_err::{DebugErr, src},
+    http::{StatusCode, uri::Uri},
+    http_body_util::{BodyExt, Empty},
+    hyper::body::Bytes,
+    hyper_util::{client::legacy::Client, rt::TokioExecutor},
+    hyper_rustls::ConfigBuilderExt,
+    quick_xml::{events::{Event}, reader::Reader},
+    rustls::{version::TLS13},
     sled::{Db, IVec},
-    std::{fmt, fs, env},
+    std::{fmt, env, io::Cursor, path::PathBuf, str::FromStr},
 };
 
 static BASE_URI: &'static str = "https://api.stlouisfed.org/fred";
 
-#[macro_export]
-macro_rules! src {
-    {} => 
-    { $crate::src(
-        option_env!("CARGO_PKG_NAME").map(|s| s.to_string()),
-        file!(),
-        line!(),
-    )};
-}
+type Result<T> = std::result::Result<T, DebugErr>;
 
-fn src (
-    crate_name: Option<String>,
-    file: &str,
-    line: u32) -> String 
-{
-    match &crate_name {
-        Some(crate_name) => format!("[{}:{}:{}]", crate_name, file, line),
-        None => format!("[unknown:{}:{}]", file, line),
+/**
+Retrieves ``FRED_CACHE`` environment variable if set or fails.
+*/    
+pub fn fred_cache(opt_path: Option<&str>) -> Result<PathBuf> {
+    match opt_path {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => {
+            env::var("FRED_CACHE")
+                .map(PathBuf::from)
+                .map_err(|e| src!("Failed to read FRED_CACHE with error: '{e}'."))
+        },
     }
 }
 
 /**
-Build a request from the string specification.
-
-See the [FRED API documentation](https://fred.stlouisfed.org/docs/api/fred/) to build
-requests. In these docs each request category has an example XML request such as
-
-`https://api.stlouisfed.org/fred/series/observations?series_id=GNPCA&api_key=abcdefghijklmnopqrstuvwxyz123456`
-
-Extract the middle-part from this, ignoring 
-
-`https://api.stlouisfed.org/fred/`
-
-at the start and 
-
-`&api_key=abcdefghijklmnopqrstuvwxyz123456`
-
- at the end. For example
-```ignore
-let (req_spec, req) = request("series/observations?series_id=GNPCA").unwrap();
+Build a request from the mid-part of the URL.
+```text
+https://api.stlouisfed.org/fred/series/observations?series_id=GNPCA&api_key=abcdefghijklmnopqrstuvwxyz123456
+                                ------------------------------------
 ```
+If ``FRED_API_KEY`` is set as an environment variable use ``None``.
 */
-pub fn build_request(mid_part: &str) -> Result<(RequestSpec, Request<Body>), String> {
-    let req_spec = RequestSpec::new(mid_part);
-    let req_builder: http::request::Builder = Request::builder();
-    let uri = req_spec.uri()?;
-    match req_builder.method("GET").uri(uri).body(Body::empty()) {
-        Ok(req) => Ok((req_spec, req)),
-        Err(err) => {
-            let msg = format!("{} {}", src!(), err);
-            Err(msg)
-        },
-    }
+// No tests required because this function is just very simple window dressing for users.
+// test:
+pub fn build_request(mid_part: &str, api_key: Option<&str>) -> Result<RequestSpec> {
+    RequestSpec::new(mid_part, api_key)
 }
 
 /**
-Make a request from cache.
+Non-async request to cache only.
 */
-fn cache_request(req_spec: &RequestSpec, db: &Db) -> Result<Option<Vec<u8>>, String> {
-    let key: IVec = req_spec.clone().into();
-    let ivec = match db.get(key) {
+// test: cache_request_hit_and_miss_works
+pub fn cache_request(req: &RequestSpec, db: &Db) -> Result<Option<IVec>> {
+    // let key: IVec = req.clone().into();
+    let ivec = match db.get(req.ivec()) {
         Ok(Some(ivec)) => ivec,
-        Ok(None) => {
-            if let Err(err) = fs::write( "debug.xml", format!("{} not in cache", req_spec)) {
-                let msg = format!("{} {}", src!(), err);
-                return Err(msg)
-            };
-            return Ok(None)
-        },
-        Err(err) => {
-            let msg = format!("{} {}", src!(), err);
-            return Err(msg)
-        },
+        Ok(None) => { return Ok(None) },
+        // Failed to induce an error in Sled using Linux permissions or disk corruption.
+        Err(e) => Err(src!("{e}"))?,
     };
-    let bytes: Vec<u8> = ivec.to_vec();
-    if let Err(err) = fs::write("debug.xml", &bytes) {
-        let msg = format!("{} {}", src!(), err);
-        return Err(msg)
-    };
-    return Ok(Some(bytes));
+    return Ok(Some(ivec));
 }
 
 /**
-Make a request from FRED. FRED requests always update the cache. A `RequestSpec` is
-included as an argument so that it can be used as a key to store a successful request
-in the cache.
+Request to FRED bypassing cache.
 */
-async fn fred_request(
-    req_spec: &RequestSpec,
-    req: Request<Body>,
-    db: &Db) -> Result<Vec<u8>, String> 
-{
-    let client_builder: hyper::client::Builder = Client::builder();
-    let mut https_connector: HttpsConnector<HttpConnector> = HttpsConnector::new();
-    https_connector.https_only(true);
-    let client: Client<HttpsConnector<HttpConnector>, Body> = 
-        client_builder.build(https_connector);
-    // req is of type Request<Body>
-    //
-    let resp: Response<Body> = match client.request(req).await {
-        Ok(r) => r,
-        Err(err) => {
-            return Err(format!("{} {}", src!(), err))
-        },
-    };
-    let status_code = resp.status();
-    match resp.status() {
-        StatusCode::OK => {
-            let bytes: Vec<u8> = match hyper::body::to_bytes(resp).await {
-                Ok(b) => b.to_vec(),
-                Err(err) => {
-                    let msg = format!("{} {}", src!(), err);
-                    return Err(msg)
-                },
-            };
-            if let Err(err) = fs::write("debug.xml", &bytes) {
-                let msg = format!("{} {}", src!(), err);
-                return Err(msg)
-            };
-            write_to_cache(req_spec, &bytes.clone(), db)?;
-            Ok(bytes)
+// test: fred_request_should_return_err_on_bad_request
+async fn fred_request(req: &RequestSpec, db: &Db) -> Result<IVec> {
+    let tls = rustls::ClientConfig::builder_with_protocol_versions(&[&TLS13])
+        .with_native_roots().map_err(|e| src!("{e}"))?
+        .with_no_client_auth();
+
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_only()
+        .enable_http2()
+        .build();
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+
+    let fut = async move {
+        let res = client
+            .get(req.uri()?)
+            .await
+            .map_err(|err| src!("Request failed with error: {err}."))?;
+
+        let status = res.status();
+
+        let body = res
+            .into_body()
+            .collect()
+            .await
+            .map_err(|err| src!("Could not get body: {err}."))?
+            .to_bytes();
+
+        if status == StatusCode::OK {
+            write_to_cache(req, body.as_ref(), db)?;
+            let ivec = db
+                .get(req.ivec())
+                .map_err(|e| src!("{e}"))?
+                .ok_or(src!("Just inserted but not found"))?;
+            Ok(ivec)
+        } else {
+            let mut field_iter = FieldIter::new("error", vec!["message"], body.as_ref().into())
+                .take_while(|result| result.is_ok()).map(|result| result.unwrap());
+            
+            let message = field_iter.next()
+                .and_then(|fields| fields.first().cloned())
+                .unwrap_or("Unknown error".to_string());
+            Err(src!("FRED API error: '{message}'"))
         }
-        _ => Err(format!("{} {}", src!(), status_code)),
-    }
+    };
+
+    fut.await
 }
 
 /**
-Send a request, specifying if the request should go to the cache first, and if the
-request should go to FRED. Successful requests to FRED are always cached.
+Send a request to FRED or the cache, using the lookup method to determine procedure.
 ```no_run
-use fred_api::{build_request, send_request};
+use fred_api::{build_request, fred_cache, Lookup, send_request};
 
 # tokio_test::block_on(async {
-let db: sled::Db = sled::open("../fred_cache/db").unwrap();
-let (req_spec, req) = build_request("series/observations?series_id=CPGRLE01AUQ657N").unwrap();
-// request to cache is `true`
-// request to FRED is `false`
-let bytes = send_request(&req_spec, req, true, false, &db).await.unwrap();
+let db: sled::Db = sled::open(fred_cache(None).unwrap()).unwrap();
+let req = build_request("series/observations?series_id=CPGRLE01AUQ657N&", None).unwrap();
+let bytes = send_request(&req, Lookup::CacheOnly, &db).await.unwrap();
 # })
 ```
 */
 pub async fn send_request(
-    req_spec: &RequestSpec,
-    req: Request<Body>,
-    cache: bool,
-    fred: bool,
-    db: &Db) -> Result<Vec<u8>, String> 
+    req: &RequestSpec,
+    lookup: Lookup,
+    db: &Db) -> Result<IVec> 
 {
-    match (cache, fred) {
-        (true, true) => {
-            match cache_request(req_spec, db) {
-                Ok(None) => {
-                    return fred_request(req_spec, req, db).await
-                },
+    match lookup {
+        Lookup::FredOnCacheMiss => {
+            match cache_request(req, db) {
+                Ok(None) => { return fred_request(req, db).await },
                 Ok(Some(bytes)) => return Ok(bytes),
                 Err(e) => return Err(e),
             }
         },
-        (true, false) => {
-            match cache_request(req_spec, db) {
+        Lookup::CacheOnly => {
+            match cache_request(req, db) {
                 Ok(Some(bytes)) => Ok(bytes),
-                Ok(None) => Err("Cache only request failed.".to_string()),
+                Ok(None) => Err(src!(
+                    "Cache only request (mid-part '{}') failed",
+                    req.mid_part()
+                ))?,
                 Err(e) => Err(e),
             }
         },
-        (false, true) => {
-            match fred_request(req_spec, req, db).await {
+        Lookup::FredOnly => {
+            match fred_request(req, db).await {
                 Ok(bytes) => Ok(bytes),
                 Err(e) => Err(e),
             }
         },
-        _ => Err(src!()),
     }
 }
 
 /*
 Write a FRED response into the caching database.
 */
-fn write_to_cache(req_spec: &RequestSpec, bytes: &[u8], db: &Db) -> Result<(), String> {
-    let key: IVec = req_spec.clone().into();
+fn write_to_cache(req: &RequestSpec, bytes: &[u8], db: &Db) -> Result<()> {
+    let key: IVec = req.ivec();
     let value: IVec = bytes.as_ref().into();
     match db.contains_key(&key) {
         Ok(true) => {},
-        Ok(false) => {
-            if let Err(err) = db.insert(key, value) {
-                let msg = format!("{} {}", src!(), err);
-                return Err(msg)
-            }
-        },
-        Err(err) => {
-            let msg = format!("{} {}", src!(), err);
-            return Err(msg)
-        },
+        Ok(false) => { if let Err(err) = db.insert(key, value) { Err(src!("{err}"))? }},
+        Err(err) => Err(src!("{err}"))?,
     }
     Ok(())
 }
@@ -287,122 +229,352 @@ fn write_to_cache(req_spec: &RequestSpec, bytes: &[u8], db: &Db) -> Result<(), S
 A request spec is the middle-part of a FRED request Uri with the base part removed
 from the left and the API key removed from the right.
 */
-#[derive(Clone, Debug)]
-pub struct RequestSpec(String);
+#[derive(Clone)]
+pub struct RequestSpec {
+    mid_part: String,
+    key: String,
+}
 
 impl RequestSpec {
-    pub fn new(mid_part: &str) -> Self {
-        RequestSpec(String::from(mid_part))
+
+    /**
+    If ``api_key`` is ``None``, checks for environment variable ``FRED_API_KEY``, else
+    uses the value provided.
+    */
+    // test: new_request_spec_works
+    pub fn new(mid_part: &str, api_key: Option<&str>) -> Result<Self> {
+        let key = match api_key {
+            Some(key) => key.to_string(),
+            None => env::var("FRED_API_KEY")
+                .map_err(|err| src!("FRED_API_KEY environment variable missing: {err}"))?,
+        };
+        Ok(RequestSpec {
+            mid_part: mid_part.to_string(),
+            key,
+        })
     }
 
-    pub fn uri(&self) -> Result<String, String> {
-        let key = match env::var("FRED_API_KEY") {
-            Ok(key) => key,
-            Err(err) => {
-                let msg = format!("{} The FRED_API_KEY environment variable must be set. {}", src!(), err);
-                return Err(msg)
-            },
-        };
-        Ok(format!("{}/{}&api_key={}", BASE_URI, self.0, key))
+    // test: uri_request_spec_edge_case
+    pub fn uri(&self) -> Result<Uri> {
+        let s = &format!("{}/{}api_key={}", BASE_URI, self.mid_part, self.key);
+        Ok(Uri::from_str(s).map_err(|e| src!("{e}"))?)
     }
+
+    pub fn mid_part(&self) -> String { self.mid_part.clone() }
+
+    // test: ivec_as_key
+    pub fn ivec(&self) -> IVec {
+        self.mid_part.as_bytes().into()
+    }
+
+    pub fn has_api_key(&self) -> bool { !self.key.is_empty() }
 }
 
 impl fmt::Display for RequestSpec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.0) }
+    // test: request_spec_hides_api_key    
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.mid_part) }
 }
 
-impl Into<IVec> for RequestSpec {
-    fn into(self) -> IVec { self.0.as_bytes().into() }
+impl std::fmt::Debug for RequestSpec {
+    // test: request_spec_hides_api_key    
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key_len = self.key.len();
+        f.debug_struct("RequestSpec")
+            .field("mid_part", &self.mid_part)
+            .field("key", &format!("({} characters)", key_len))
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FieldIter {
+    reader: Reader<Cursor<IVec>>, // Use Cursor<IVec>
+    fields: Vec<String>,
+    tag: String,
+    buf: Vec<u8>,
+    has_errored: bool,
+}
+
+impl FieldIter {
+    pub fn new(tag: &str, fields: Vec<&str>, ivec: IVec) -> Self {
+        let tag = tag.to_string();
+        let fields = fields.into_iter().map(|s| s.to_string()).collect();
+        let mut reader = Reader::from_reader(Cursor::new(ivec.clone()));
+        reader.config_mut().trim_text(true);
+        FieldIter {
+            reader,
+            fields,
+            tag,
+            buf: Vec::new(),
+            has_errored: false,
+        }
+    }
+}
+
+impl Iterator for FieldIter {
+    type Item = Result<Vec<String>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.has_errored {
+            return None;
+        }
+        loop {
+            self.buf.clear();
+            match self.reader.read_event_into(&mut self.buf) {
+                Ok(Event::Start(bytes_start)) | Ok(Event::Empty(bytes_start))
+                    if bytes_start.name().as_ref() == self.tag.as_bytes() => {
+                    let mut row = Vec::with_capacity(self.fields.len());
+                    for field in &self.fields {
+                        let attr_value = bytes_start
+                            .attributes()
+                            .filter_map(std::result::Result::ok)
+                            .find(|a| a.key.as_ref() == field.as_bytes());
+
+                        match attr_value {
+                            Some(a) => match self.reader.decoder().decode(&a.value) {
+                                Ok(value) => {
+                                    if value.is_empty() {
+                                        self.has_errored = true;
+                                        return Some(Err(src!(
+                                            "Empty attribute '{}' in tag '{}'",
+                                            field,
+                                            self.tag
+                                        )));
+                                    }
+                                    row.push(value.to_string());
+                                }
+                                Err(e) => {
+                                    self.has_errored = true;
+                                    return Some(Err(src!(
+                                        "XML decoding error for attribute '{}': {}",
+                                        field,
+                                        e
+                                    )));
+                                }
+                            },
+                            None => {
+                                self.has_errored = true;
+                                return Some(Err(src!(
+                                    "Missing attribute '{}' in tag '{}'",
+                                    field,
+                                    self.tag
+                                )));
+                            }
+                        }
+                    }
+                    return Some(Ok(row));
+                }
+                Ok(Event::Eof) => return None,
+                Err(e) => {
+                    self.has_errored = true;
+                    return Some(Err(src!("XML parsing error: {e}")));
+                }
+                _ => (),
+            }
+        }
+    }
 }
 
 /**
-Return a `Vec` of a `Vec` of bytes extracted from response bytes. The
-fields must be in the order they are found in the response.
+Determines the lookup method. A successful request will always write to the cache.
 */
-pub fn capture_fields(
-    // "<observation field1="value"...>" The first tags here is 'observation'.
-    first_tag: &str,
-    fields: Vec<&str>,
-    bytes: &[u8]) -> Vec<Vec<Vec<u8>>>
-{
-    let spacer = "[^>]*";
+#[derive(Clone, Copy, Debug)]
+pub enum Lookup {
+    FredOnCacheMiss,
+    FredOnly,
+    CacheOnly,
+}
 
-    let mut re_str = format!("<{} {}", first_tag, spacer);
-
-    for (i, field_name) in fields.iter().enumerate() {
-
-        let field_cap = &format!(r#"{}="([^"]*)""#, field_name);
-        re_str.push_str(field_cap);
-
-        if i < fields.len() { re_str.push_str(spacer) }
-    }
-    re_str.push('>');
-
-    let re = Regex::new(&re_str).unwrap();
-    let caps: CaptureMatches = re.captures_iter(&bytes);
-
-    let mut acc = Vec::new();
-    for cap in caps {
-        let mut field_vec = Vec::new();
-        for field_idx in 1..=fields.len() {
-            let bytes = &cap[field_idx];
-            field_vec.push(bytes.to_vec());
+impl FromStr for Lookup {
+    type Err = DebugErr;
+    
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "fred_on_cache_miss" => Ok(Lookup::FredOnCacheMiss),
+            "fred_only" => Ok(Lookup::FredOnly),
+            "cache_only" => Ok(Lookup::CacheOnly),
+            _ => Err(src!("Could not parse '{}'", s))?,
         }
-        acc.push(field_vec)
     }
-    acc
 }
 
-#[test]
-fn build_fields_regex_step_1() {
+#[cfg(test)]
+mod test {
+    use {
+        crate::*,
+        lazy_static::lazy_static,
+        tempfile::TempDir,
+    };
 
-    let bytes: Vec<u8> = r#"<?xml version="1.0" encoding="utf-8" ?>
-<seriess realtime_start="2023-11-30" realtime_end="2023-11-30" order_by="series_id" sort_order="asc" count="157" offset="0" limit="1000">
-  <series id="AUSUR24NAA" realtime_start="2023-11-30" realtime_end="2023-11-30" title="Adjusted Unemployment Rate for Persons Ages 20 to 24 in Australia (DISCONTINUED)" observation_start="1978-01-01" observation_end="2012-01-01" frequency="Annual" frequency_short="A" units="Percent" units_short="%" seasonal_adjustment="Not Seasonally Adjusted" seasonal_adjustment_short="NSA" last_updated="2013-06-10 09:17:22-05" popularity="0" group_popularity="0" notes="Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparisons (ILC) program. This is the last BLS release of international comparisons of annual labor force statistics."/>
-  <series id="AUSURAMS" realtime_start="2023-11-30" realtime_end="2023-11-30" title="Adjusted Unemployment Rate in Australia (DISCONTINUED)" observation_start="2007-01-01" observation_end="2013-06-01" frequency="Monthly" frequency_short="M" units="Percent" units_short="%" seasonal_adjustment="Seasonally Adjusted" seasonal_adjustment_short="SA" last_updated="2013-09-03 11:06:02-05" popularity="1" group_popularity="1" notes="Series is adjusted to U.S. Concepts.
-Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparisons (ILC) program. This is the last BLS release of international unemployment rates and employment indexes."/>
-</seriess>"#.as_bytes().into();
+    lazy_static! {
+        static ref TEMP_DIR: TempDir = TempDir::new().unwrap();
+        static ref DB: Db = sled::open(TEMP_DIR.path()).unwrap();
+    }    
 
-    let re_init = "<series [^>]*>";
-    let re = Regex::new(re_init).unwrap();
-    let iter = re.find_iter(&bytes);
-    let v: Vec<()> = iter.map(|_| ()).collect();
-    assert_eq!(v.len(), 2); // two matches
+    fn get_db() -> &'static Db {
+        &DB
+    }    
+
+    /// Creates a sled database in a temporary directory.
+    // test:
+    fn create_temp_cache() -> Db {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        sled::open(temp_dir.path()).expect("Failed to open sled database")
+    }    
+
+    #[test]
+    fn new_request_spec_works() {
+
+        // Ends with API key.
+        let api_key = "abcdefghijklmnopqrstuvwxyz123456";
+        let req_spec = RequestSpec::new("tags?", Some(api_key)).unwrap();
+        assert!(req_spec.uri().unwrap().to_string()
+            .ends_with(&format!("api_key={}", api_key))
+        );
+
+        // Agree with FRED documentation
+        let api_key = "abcd";
+        let samples = vec![
+            (
+                "category?category_id=125&",
+                "https://api.stlouisfed.org/fred/category?category_id=125&api_key=abcd",
+            ),
+            (
+                "category/children?category_id=13&",
+                "https://api.stlouisfed.org/fred/category/children?category_id=13&api_key=abcd",
+            ),
+            (
+                "category/related?category_id=32073&",
+                "https://api.stlouisfed.org/fred/category/related?category_id=32073&api_key=abcd",
+            ),
+        ];
+        for sample in samples {
+            assert_eq!(
+                RequestSpec::new(sample.0, Some(api_key)).unwrap().uri().unwrap().to_string(),
+                sample.1,
+            )
+        }
+    }
+    
+    #[tokio::test]
+    async fn cache_request_hit_and_miss_works() {
+
+        // Set up request
+        let api_key = "abcd";
+        let req = RequestSpec::new("category?category_id=125&", Some(api_key)).unwrap();
+        let response_bytes: &[u8] = b"response_bytes";
+        let db = create_temp_cache();
+
+        // Insert a test key-value pair to the test cache.
+        let key: IVec = req.ivec();
+        let value: IVec = response_bytes.as_ref().into();
+        db.insert(key, value).unwrap();
+
+        // Should return value on cache hit.
+        assert_eq!(cache_request(&req, &db).unwrap().unwrap(), response_bytes);
+
+        let req = RequestSpec::new("category/children?category_id=13&", Some(api_key)).unwrap();
+
+        // Should return None on cache-miss.
+        assert!(cache_request(&req, &db).unwrap().is_none());
+    }
+
+    #[test]
+    fn uri_request_spec_edge_case() {
+        // Space.
+        let e = RequestSpec::new("observations?series_id=GNPCA &", Some("abcd"))
+            .unwrap()
+            .uri()
+            .unwrap_err();
+        // No space.
+        let _ = RequestSpec::new("observations?series_id=GNPCA&", Some("abcd"))
+            .unwrap()
+            .uri()
+            .is_ok();
+        assert_eq!(e.msg, "invalid uri character");
+    }
+
+    #[test]
+    fn ivec_as_key() {
+        let ivec: IVec = RequestSpec::new("observations?series_id=GNPCA&", Some("abcd"))
+            .unwrap()
+            .ivec();
+        assert_eq!(b"observations?series_id=GNPCA&", &*ivec);
+    }
+
+    #[test]
+    fn bytes_from_ivec_are_unchanged() {
+        let bytes: Vec<u8> = r#"<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n<observations realtime_start=\"2025-10-04\" realtime_end=\"2025-10-04\" observation_start=\"1600-01-01\" observation_end=\"9999-12-31\" units=\"lin\" output_type=\"1\" file_type=\"xml\" order_by=\"observation_date\" sort_order=\"asc\" count=\"210\" offset=\"0\" limit=\"100000\">\n  <observation realtime_start=\"2025-10-04\" realtime_end=\"2025-10-04\" date=\"1971-04-01\" value=\"0.850603488248666\"/>\n  <observation realtime_start=\"2025-10-04\" realtime_end=\"2025-10-04\" date=\"1971-07-01\" value=\"3.43557210303712\"/>\n  <observation realtime_start=\"2025-10-04\" realtime_end=\"2025-10-04\" date=\"1971-10-01\" value=\"1.90453329926268\"/>\n  <observation realtime_start=\"2025-10-04\" realtime_end=\"2025-10-04\" date=\"1972-01-01\" value=\"0.988357368475625\"/>\n  <observation realtime_start=\"2025-10-04\" realtime_end=\"2025-10-04\" date=\"1972-04-01\" value=\"1.14890574736089\"/>\n  <observation realtime_start=\"2025-10-04\" realtime_end=\"2025-10-04\" date=\"1972-07-01\" value=\"1.84453195549092\"/>\n  <observation realtime_start=\"2025-10-04\" realtime_end=\"2025-10-04\" date=\"1972-10-01\" value=\"0.838712265813754\"/>\n</observations>\n\n\n\n"#.into();
+        let ivec: IVec = bytes.clone().into();
+        let bytes_from_ivec = &*ivec;
+        assert_eq!(bytes.clone(), bytes_from_ivec);
+    }
+
+    #[test]
+    fn request_spec_hides_api_key() {
+        // Debug.
+        assert_eq!(
+            format!("{:?}", RequestSpec::new("abc", Some("abcdefghijklmnopqrstuvwxyz123456")).unwrap()),
+            "RequestSpec { mid_part: \"abc\", key: \"(32 characters)\" }"
+        );
+        // Display.
+        assert_eq!(
+            format!("{}", RequestSpec::new("abc", Some("abcdefghijklmnopqrstuvwxyz123456")).unwrap()),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn has_api_key_works() {
+        let req = RequestSpec::new("observations?series_id=GNPCA&", Some("abcd")).unwrap();
+        assert!(req.has_api_key());
+
+        // Requires test for None, that first removes the environment variable, runs
+        // the test, and then resets the environment variable.
+    }
+
+    #[test]
+    fn field_iter_repeats_error_despite_valid_next_line() {
+        let mut xml: Vec<u8> = r#"<?xml version="1.0" encoding="utf-8" ?>
+    <observations>
+        <observation date="1929-01-01" value="1202.659" />
+        <observation date=""#.to_string().into_bytes();
+        xml.push(0xFF); // Non-UTF-8 byte
+        xml.extend(r#"" value="1000.0" />
+        <observation date="1930-01-01" value="1000.0" />
+    </observations>"#.to_string().into_bytes());
+
+        let mut field_iter = FieldIter::new("observation", vec!["date", "value"], xml.into());
+
+        assert_eq!(
+            field_iter.next().unwrap().unwrap(),
+            vec!["1929-01-01".to_string(), "1202.659".to_string()],
+        );
+
+        if let Err(e) = field_iter.next().unwrap() {
+            assert!(e.msg.contains("invalid utf-8"))
+        } else {
+            assert!(false, "Should fail")
+        }
+
+        assert!(field_iter.next().is_none())
+    }    
+
+    #[test]
+    fn field_iter_errors_on_missing_attribute() {
+        let xml: Vec<u8> = r#"<?xml version="1.0" encoding="utf-8" ?>
+    <observations>
+        <observation date="1929-01-01" value="1202.659" />
+        <observation date="1929-02-01" />
+        <observation date="1930-01-01" value="1000.0" />
+    </observations>"#.to_string().into_bytes();
+
+        let mut field_iter = FieldIter::new("observation", vec!["date", "value"], xml.into());
+
+        assert_eq!(
+            field_iter.next().unwrap().unwrap(),
+            vec!["1929-01-01".to_string(), "1202.659".to_string()],
+        );
+    }
 }
 
-#[test]
-fn build_fields_regex_step_2() {
-
-    let bytes: Vec<u8> = r#"<?xml version="1.0" encoding="utf-8" ?>
-<seriess realtime_start="2023-11-30" realtime_end="2023-11-30" order_by="series_id" sort_order="asc" count="157" offset="0" limit="1000">
-  <series id="AUSUR24NAA" realtime_start="2023-11-30" realtime_end="2023-11-30" title="Adjusted Unemployment Rate for Persons Ages 20 to 24 in Australia (DISCONTINUED)" observation_start="1978-01-01" observation_end="2012-01-01" frequency="Annual" frequency_short="A" units="Percent" units_short="%" seasonal_adjustment="Not Seasonally Adjusted" seasonal_adjustment_short="NSA" last_updated="2013-06-10 09:17:22-05" popularity="0" group_popularity="0" notes="Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparisons (ILC) program. This is the last BLS release of international comparisons of annual labor force statistics."/>
-  <series id="AUSURAMS" realtime_start="2023-11-30" realtime_end="2023-11-30" title="Adjusted Unemployment Rate in Australia (DISCONTINUED)" observation_start="2007-01-01" observation_end="2013-06-01" frequency="Monthly" frequency_short="M" units="Percent" units_short="%" seasonal_adjustment="Seasonally Adjusted" seasonal_adjustment_short="SA" last_updated="2013-09-03 11:06:02-05" popularity="1" group_popularity="1" notes="Series is adjusted to U.S. Concepts.
-Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparisons (ILC) program. This is the last BLS release of international unemployment rates and employment indexes."/>
-</seriess>"#.as_bytes().into();
-
-    let spacer = "[^>]*";
-    let field_cap = &format!(r#"{}="([^"]*)"#, "id");
-
-    let re_init = &format!(r#"<{} {}{}{}>"#, "series", spacer, field_cap, spacer);
-
-    // let re_init = r#"<series [^>]*id="([^"]*)"[^>]*>"#;
-    let re = Regex::new(re_init).unwrap();
-    let mut iter = re.captures_iter(&bytes);
-    assert_eq!(&iter.next().unwrap()[1], "AUSUR24NAA".as_bytes());
-    assert_eq!(&iter.next().unwrap()[1], "AUSURAMS".as_bytes());
-}
-
-#[test]
-fn build_fields_regex_step_3() {
-
-    let bytes: Vec<u8> = r#"<?xml version="1.0" encoding="utf-8" ?>
-<seriess realtime_start="2023-11-30" realtime_end="2023-11-30" order_by="series_id" sort_order="asc" count="157" offset="0" limit="1000">
-  <series id="AUSUR24NAA" realtime_start="2023-11-30" realtime_end="2023-11-30" title="Adjusted Unemployment Rate for Persons Ages 20 to 24 in Australia (DISCONTINUED)" observation_start="1978-01-01" observation_end="2012-01-01" frequency="Annual" frequency_short="A" units="Percent" units_short="%" seasonal_adjustment="Not Seasonally Adjusted" seasonal_adjustment_short="NSA" last_updated="2013-06-10 09:17:22-05" popularity="0" group_popularity="0" notes="Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparisons (ILC) program. This is the last BLS release of international comparisons of annual labor force statistics."/>
-  <series id="AUSURAMS" realtime_start="2023-11-30" realtime_end="2023-11-30" title="Adjusted Unemployment Rate in Australia (DISCONTINUED)" observation_start="2007-01-01" observation_end="2013-06-01" frequency="Monthly" frequency_short="M" units="Percent" units_short="%" seasonal_adjustment="Seasonally Adjusted" seasonal_adjustment_short="SA" last_updated="2013-09-03 11:06:02-05" popularity="1" group_popularity="1" notes="Series is adjusted to U.S. Concepts.
-Bureau of Labor Statistics (BLS) has eliminated the International Labor Comparisons (ILC) program. This is the last BLS release of international unemployment rates and employment indexes."/>
-</seriess>"#.as_bytes().into();
-
-    let caps = capture_fields("series", vec!("id"), &bytes);
-    assert_eq!(caps[0], vec!("AUSUR24NAA".as_bytes()));
-    assert_eq!(caps[1], vec!("AUSURAMS".as_bytes()));
-}
