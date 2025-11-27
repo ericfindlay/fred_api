@@ -10,12 +10,6 @@ avoided.
 2. ``FRED_CACHE`` is the directory to place the cache. It can also be set as an
 environment variable or supplied directly.
 
-A key can be obtained by creating an account at [FRED](https://fredaccount.stlouisfed.org/login/secure/)
-, and should be set as an environment variable like
-```text
-FRED_API_KEY=abcdefghijklmnopqrstuvwxyz123456
-```
-
 ### Code Example
 
 ```no_run
@@ -409,10 +403,6 @@ mod test {
     lazy_static! {
         static ref TEMP_DIR: TempDir = TempDir::new().unwrap();
         static ref DB: Db = sled::open(TEMP_DIR.path()).unwrap();
-    }    
-
-    fn get_db() -> &'static Db {
-        &DB
     }    
 
     /// Creates a sled database in a temporary directory.

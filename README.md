@@ -9,15 +9,9 @@ avoided.
 2. ``FRED_CACHE`` is the directory to place the cache. It can also be set as an
 environment variable or supplied directly.
 
-A key can be obtained by creating an account at [FRED](https://fredaccount.stlouisfed.org/login/secure/)
-, and should be set as an environment variable like
-```text
-FRED_API_KEY=abcdefghijklmnopqrstuvwxyz123456
-```
-
 ### Code Example
 
-```no_run
+```rust
 use {
     debug_err::{DebugErr, src},
     fred_api::{build_request, FieldIter, fred_cache, Lookup, send_request},
