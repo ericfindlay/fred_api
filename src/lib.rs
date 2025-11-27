@@ -49,7 +49,6 @@ pub async fn main() {
 */
 
 use {
-    debug_err::{DebugErr, src},
     http::{StatusCode, uri::Uri},
     http_body_util::{BodyExt, Empty},
     hyper::body::Bytes,
@@ -63,7 +62,8 @@ use {
 
 static BASE_URI: &'static str = "https://api.stlouisfed.org/fred";
 
-type Result<T> = std::result::Result<T, DebugErr>;
+pub use debug_err::{src, DebugErr};
+pub type Result<T> = std::result::Result<T, DebugErr>;
 
 /**
 Retrieves ``FRED_CACHE`` environment variable if set or fails.
