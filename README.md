@@ -12,12 +12,9 @@ environment variable or supplied directly.
 ### Code Example
 
 ```rust
-use {
-    debug_err::{DebugErr, src},
-    fred_api::{build_request, FieldIter, fred_cache, Lookup, send_request},
-    sled::{Db, IVec},
-    tokio,
-};
+use fred_api::*;
+use sled::{Db, IVec};
+use tokio;
 
 #[tokio::main]
 pub async fn main() {
